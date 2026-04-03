@@ -1,0 +1,23 @@
+# Auto-generated runtime files
+token_data.json
+tokenbar.pid
+tokenbar.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.exe
+
+# Claude Code local settings
+.claude/
