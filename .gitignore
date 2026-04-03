@@ -3,6 +3,9 @@ token_data.json
 tokenbar.pid
 tokenbar.log
 
+# User configuration (personal overrides)
+config.json
+
 # Python
 __pycache__/
 *.pyc

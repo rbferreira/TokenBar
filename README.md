@@ -31,9 +31,23 @@ TokenBar embeds a compact overlay on your Windows taskbar showing:
 Claude Code  ──stdin──▶  statusline.py  ──writes──▶  token_data.json  ◀──reads──  tokenbar.py
 ```
 
-1. **`statusline.py`** is configured as Claude Code's `statusLine` handler. After each turn, Claude Code pipes turn metadata (tokens, cost, rate limits) to it via stdin. It accumulates the data into `token_data.json` and prints an ANSI status line back to the terminal.
+1. **`statusline.py`** is configured as Claude Code's `statusLine` handler. After each turn, Claude Code pipes turn metadata (tokens, cost, rate limits) to it via stdin. It accumulates the data into `token_data.json` (atomic writes) and prints an ANSI status line back to the terminal.
 
 2. **`tokenbar.py`** is a standalone Tkinter GUI that polls `token_data.json` every 2 seconds and renders the metrics as a frameless, always-on-top window positioned on the Windows taskbar.
+
+## Project structure
+
+```
+TokenBar/
+├── shared.py          # Atomic I/O, formatting, data schema
+├── config.py          # Configuration dataclass + config.json loader
+├── win32_utils.py     # Win32 API helpers + singleton mutex
+├── tokenbar.py        # GUI widget (Tkinter)
+├── statusline.py      # Claude Code stdin handler
+├── pyproject.toml     # Package metadata
+├── config.json        # User overrides (optional)
+└── LICENSE
+```
 
 ## Requirements
 
@@ -66,6 +80,28 @@ python tokenbar.py
 ```
 
 The widget will appear on the left side of your taskbar. It auto-updates every 2 seconds.
+
+## Configuration
+
+Create a `config.json` next to the scripts to customize appearance and behavior:
+
+```json
+{
+  "font_family": "JetBrains Mono",
+  "font_size": 11,
+  "alpha": 0.90,
+  "refresh_ms": 3000,
+  "initial_x": 200,
+  "theme": {
+    "bg": "#1E1E2E",
+    "fg_green": "#A6E3A1",
+    "fg_orange": "#FAB387",
+    "fg_red": "#F38BA8"
+  }
+}
+```
+
+Only include keys you want to override. See `config.py` for all available options.
 
 ### Optional: auto-start on login
 
@@ -107,4 +143,4 @@ pyinstaller --onefile --noconsole tokenbar.py
 
 ## License
 
-MIT
+[MIT](LICENSE)

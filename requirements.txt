@@ -1,4 +1,0 @@
-# TokenBar dependencies
-# tkinter and ctypes are included in the Python standard library — no pip install needed.
-# If you want to package tokenbar.py as a standalone .exe, install:
-# pyinstaller

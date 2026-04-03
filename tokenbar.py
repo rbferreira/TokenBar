@@ -1,29 +1,47 @@
 """
-tokenbar.py — Windows taskbar token usage widget for Claude Code.
+tokenbar.py — Windows taskbar token-usage widget for Claude Code.
 
-Displays inside the taskbar (left side): session rate limit %, weekly rate
-limit %, time until session reset, and session cost.
+Displays inside the taskbar (left side): session rate-limit %,
+weekly rate-limit %, time until session reset, and session cost.
 
-Hover: tooltip with raw token counts and reset times.
+Hover:  tooltip with raw token counts and reset times.
 Right-click: reset session / exit.
 Left-click drag: reposition the window.
 
 Usage:
-    pythonw tokenbar.py
+    pythonw tokenbar.py        # windowless (recommended)
+    python  tokenbar.py        # with console for debugging
 
-Reads token_data.json (written by statusline.py) every 2 seconds.
+Reads token_data.json (written by statusline.py) every refresh cycle.
 """
-import tkinter as tk
-import json
-import os
-import logging
-import ctypes
-import ctypes.wintypes
-from datetime import datetime, timedelta
+from __future__ import annotations
 
-_DIR     = os.path.dirname(os.path.abspath(__file__))
+import logging
+import os
+import tkinter as tk
+from datetime import datetime
+
+from config import Config, load_config
+from shared import (
+    DATA_FILE,
+    fmt_time_until,
+    fmt_tokens,
+    get_weekly_tokens,
+    load_data,
+    save_data,
+)
+from win32_utils import (
+    cleanup_pid_file,
+    ensure_singleton,
+    get_screen_width,
+    get_work_area,
+    get_screen_height,
+    set_topmost,
+)
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(_DIR, "tokenbar.log")
-PID_FILE = os.path.join(_DIR, "tokenbar.pid")
+PID_FILE = os.path.join(_DIR, "tokenbar.pid")  # legacy — cleaned up on start
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -32,378 +50,327 @@ logging.basicConfig(
 )
 log = logging.getLogger("tokenbar")
 
-DATA_FILE = os.path.join(_DIR, "token_data.json")
 
-# ── Win32 constants ───────────────────────────────────────────────────────────
-HWND_TOPMOST    = -1
-SWP_NOMOVE      = 0x0002
-SWP_NOSIZE      = 0x0001
-SWP_NOACTIVATE  = 0x0010
-PROCESS_TERMINATE = 0x0001
-
-BG          = "#1C1C1C"
-BG_TOOLTIP  = "#252525"
-FG_GREEN    = "#44BB44"
-FG_ORANGE   = "#FF8C00"
-FG_RED      = "#FF4444"
-FG_RESET    = "#7BAFD4"
-FG_COST     = "#CC4444"
-FG_DIM      = "#666666"
-FG_MUTED    = "#888888"
-FG_NORMAL   = "#D0D0D0"
-FONT        = ("Consolas", 10)
-FONT_BOLD   = ("Consolas", 10, "bold")
-REFRESH_MS  = 2000
-TOPMOST_MS  = 500   # how often to re-assert z-order above taskbar
-TOOLTIP_GAP = 4
-
-
-# ── Singleton ─────────────────────────────────────────────────────────────────
-
-def _kill_pid(pid: int):
-    h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-    if h:
-        ctypes.windll.kernel32.TerminateProcess(h, 0)
-        ctypes.windll.kernel32.CloseHandle(h)
-
-
-def ensure_singleton():
-    """Kill any previous tokenbar instance, then register this PID."""
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                old_pid = int(f.read().strip())
-            if old_pid != os.getpid():
-                _kill_pid(old_pid)
-                log.info("Killed previous instance pid=%s", old_pid)
-        except Exception:
-            log.exception("Could not kill previous instance")
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
-
-# ── Win32 helpers ─────────────────────────────────────────────────────────────
-
-def get_work_area() -> ctypes.wintypes.RECT:
-    rect = ctypes.wintypes.RECT()
-    ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
-    return rect
-
-
-def get_screen_height() -> int:
-    return ctypes.windll.user32.GetSystemMetrics(1)
-
-
-def win32_set_topmost(hwnd: int):
-    """Force window above taskbar using Win32 SetWindowPos (stronger than tkinter -topmost)."""
-    ctypes.windll.user32.SetWindowPos(
-        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    )
-
-
-# ── Data helpers ──────────────────────────────────────────────────────────────
-
-def load_data() -> dict:
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"session": {}, "daily": {}, "rate_limits": {}}
-
-
-def fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}k"
-    return str(n) if n else "—"
-
-
-def fmt_time_until(timestamp) -> str:
-    if not timestamp:
-        return "—"
-    try:
-        delta = datetime.fromtimestamp(timestamp) - datetime.now()
-        if delta.total_seconds() <= 0:
-            return "resetou"
-        secs = int(delta.total_seconds())
-        days, rem = divmod(secs, 86400)
-        hours, rem = divmod(rem, 3600)
-        minutes = rem // 60
-        if days > 0:
-            return f"{days}d{hours}h"
-        if hours > 0:
-            return f"{hours}h{minutes:02d}m"
-        return f"{minutes}m"
-    except Exception:
-        return "—"
-
-
-def pct_color(pct: float) -> str:
-    if pct >= 80:
-        return FG_RED
-    if pct >= 50:
-        return FG_ORANGE
-    return FG_GREEN
-
-
-def get_weekly_tokens(data: dict) -> int:
-    daily = data.get("daily", {})
-    today = datetime.now().date()
-    total = 0
-    for i in range(7):
-        day   = (today - timedelta(days=i)).isoformat()
-        entry = daily.get(day, {})
-        total += entry.get("input_tokens", 0) + entry.get("output_tokens", 0)
-    return total
-
-
-# ── Tooltip ───────────────────────────────────────────────────────────────────
+# ── Tooltip ──────────────────────────────────────────────────────────────────
 
 class Tooltip:
-    def __init__(self, parent: tk.Tk, data: dict):
+    """Hover tooltip that updates in-place without destroying/recreating widgets."""
+
+    _ROWS = [
+        "sessão desde:",
+        "tokens sessão:",
+        "tokens 7d:",
+        "5h reset em:",
+        "7d reset em:",
+    ]
+
+    def __init__(self, parent: tk.Tk, cfg: Config) -> None:
+        self.cfg = cfg
+        th = cfg.theme
+
         self.win = tk.Toplevel(parent)
         self.win.wm_overrideredirect(True)
         self.win.wm_attributes("-topmost", True)
-        self.win.configure(bg=BG_TOOLTIP)
+        self.win.configure(bg=th.bg_tooltip)
 
-        rl      = data.get("rate_limits", {})
-        fh      = rl.get("five_hour", {})
-        sd      = rl.get("seven_day", {})
+        frame = tk.Frame(self.win, bg=th.bg_tooltip, padx=10, pady=7)
+        frame.pack()
+
+        self._value_labels: list[tk.Label] = []
+        self._suffix_labels: list[tk.Label] = []
+
+        for label_text in self._ROWS:
+            row = tk.Frame(frame, bg=th.bg_tooltip)
+            row.pack(fill=tk.X, pady=1)
+
+            tk.Label(
+                row, text=label_text, bg=th.bg_tooltip, fg=th.fg_dim,
+                font=cfg.font, width=14, anchor="w",
+            ).pack(side=tk.LEFT)
+
+            val = tk.Label(
+                row, text="—", bg=th.bg_tooltip, fg=th.fg_normal,
+                font=cfg.font_bold, anchor="w",
+            )
+            val.pack(side=tk.LEFT)
+            self._value_labels.append(val)
+
+            suf = tk.Label(
+                row, text="", bg=th.bg_tooltip, fg=th.fg_muted,
+                font=cfg.font, anchor="w",
+            )
+            suf.pack(side=tk.LEFT)
+            self._suffix_labels.append(suf)
+
+    def update(self, data: dict) -> None:
+        """Update tooltip values without recreating widgets."""
+        rl = data.get("rate_limits", {})
+        fh = rl.get("five_hour", {})
+        sd = rl.get("seven_day", {})
         session = data.get("session", {})
-        cost    = session.get("cost_usd", 0.0) or 0.0
-        in_tok  = session.get("input_tokens", 0) or 0
-        out_tok = session.get("output_tokens", 0) or 0
-        weekly  = get_weekly_tokens(data)
 
-        started_at  = session.get("started_at")
+        in_tok = session.get("input_tokens", 0) or 0
+        out_tok = session.get("output_tokens", 0) or 0
+        weekly = get_weekly_tokens(data)
+
+        started_at = session.get("started_at")
         started_str = "—"
         if started_at:
             try:
                 started_str = datetime.fromisoformat(started_at).strftime("%H:%M")
-            except Exception:
+            except (ValueError, TypeError):
                 pass
 
-        rows = [
-            ("sessão desde:", started_str,                    ""),
-            ("tokens sessão:", fmt_tokens(in_tok + out_tok),  f"↑{fmt_tokens(in_tok)} ↓{fmt_tokens(out_tok)}"),
-            ("tokens 7d:",    fmt_tokens(weekly),             ""),
-            ("5h reset em:",  fmt_time_until(fh.get("resets_at")), ""),
-            ("7d reset em:",  fmt_time_until(sd.get("resets_at")), ""),
+        values = [
+            started_str,
+            fmt_tokens(in_tok + out_tok),
+            fmt_tokens(weekly),
+            fmt_time_until(fh.get("resets_at")),
+            fmt_time_until(sd.get("resets_at")),
         ]
+        suffixes = [
+            "",
+            f"  ↑{fmt_tokens(in_tok)} ↓{fmt_tokens(out_tok)}",
+            "",
+            "",
+            "",
+        ]
+        for lbl, val in zip(self._value_labels, values):
+            lbl.config(text=val)
+        for lbl, suf in zip(self._suffix_labels, suffixes):
+            lbl.config(text=suf)
 
-        frame = tk.Frame(self.win, bg=BG_TOOLTIP, padx=10, pady=7)
-        frame.pack()
-
-        for label, value, suffix in rows:
-            row = tk.Frame(frame, bg=BG_TOOLTIP)
-            row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=label, bg=BG_TOOLTIP, fg=FG_DIM,    font=FONT,      width=14, anchor="w").pack(side=tk.LEFT)
-            tk.Label(row, text=value, bg=BG_TOOLTIP, fg=FG_NORMAL, font=FONT_BOLD,           anchor="w").pack(side=tk.LEFT)
-            if suffix:
-                tk.Label(row, text=f"  {suffix}", bg=BG_TOOLTIP, fg=FG_MUTED, font=FONT, anchor="w").pack(side=tk.LEFT)
-
-    def position(self, ref_x: int, ref_y: int, ref_w: int):
+    def position(self, ref_x: int, ref_y: int) -> None:
         self.win.update_idletasks()
         tw = self.win.winfo_width()
         th = self.win.winfo_height()
-        x  = ref_x
-        y  = ref_y - th - TOOLTIP_GAP
-        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        x = ref_x
+        y = ref_y - th - self.cfg.tooltip_gap
+        screen_w = get_screen_width()
         if x + tw > screen_w:
             x = screen_w - tw - 4
         self.win.geometry(f"+{x}+{y}")
 
-    def destroy(self):
+    def destroy(self) -> None:
         self.win.destroy()
 
 
-# ── Main widget ───────────────────────────────────────────────────────────────
+# ── Main widget ──────────────────────────────────────────────────────────────
 
 class TokenBar:
-    def __init__(self):
+    def __init__(self, cfg: Config | None = None) -> None:
+        self.cfg = cfg or load_config()
+        th = self.cfg.theme
+
         self.root = tk.Tk()
         self.root.wm_overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
-        self.root.wm_attributes("-alpha", 0.95)
-        self.root.configure(bg=BG)
+        self.root.wm_attributes("-alpha", self.cfg.alpha)
+        self.root.configure(bg=th.bg)
 
         self._tooltip: Tooltip | None = None
-        self._drag_start = (0, 0)
-        self._custom_pos = False
-        self._hwnd: int  = 0
+        self._drag_start: tuple[int, int] = (0, 0)
+        self._custom_pos: bool = False
+        self._hwnd: int = 0
 
         self._build_ui()
         self.root.update()
         self._hwnd = self.root.winfo_id()
         self._position_window()
-        self._assert_topmost()  # start the topmost loop
-        self._refresh()
+        self._loop_topmost()
+        self._loop_refresh()
 
-    def _build_ui(self):
-        self.frame = tk.Frame(self.root, bg=BG, padx=8, pady=4, cursor="fleur")
+    # ── UI construction ──────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        th = self.cfg.theme
+
+        self.frame = tk.Frame(self.root, bg=th.bg, padx=8, pady=4, cursor="fleur")
         self.frame.pack()
 
-        self.lbl_5h = tk.Label(self.frame, text="—%", bg=BG, fg=FG_GREEN, font=FONT_BOLD, anchor="w")
+        self.lbl_5h = tk.Label(
+            self.frame, text="—%", bg=th.bg, fg=th.fg_green,
+            font=self.cfg.font_bold, anchor="w",
+        )
         self.lbl_5h.pack(side=tk.LEFT)
 
-        tk.Label(self.frame, text=" | ", bg=BG, fg="#444", font=FONT).pack(side=tk.LEFT)
+        self._sep(self.frame)
 
-        self.lbl_7d = tk.Label(self.frame, text="7d —%", bg=BG, fg=FG_GREEN, font=FONT_BOLD, anchor="w")
+        self.lbl_7d = tk.Label(
+            self.frame, text="7d —%", bg=th.bg, fg=th.fg_green,
+            font=self.cfg.font_bold, anchor="w",
+        )
         self.lbl_7d.pack(side=tk.LEFT)
 
-        tk.Label(self.frame, text=" | ", bg=BG, fg="#444", font=FONT).pack(side=tk.LEFT)
+        self._sep(self.frame)
 
-        self.lbl_reset = tk.Label(self.frame, text="—", bg=BG, fg=FG_RESET, font=FONT, anchor="w")
+        self.lbl_reset = tk.Label(
+            self.frame, text="—", bg=th.bg, fg=th.fg_reset,
+            font=self.cfg.font, anchor="w",
+        )
         self.lbl_reset.pack(side=tk.LEFT)
 
-        tk.Label(self.frame, text=" | ", bg=BG, fg="#444", font=FONT).pack(side=tk.LEFT)
+        self._sep(self.frame)
 
-        self.lbl_cost = tk.Label(self.frame, text="$—", bg=BG, fg=FG_COST, font=FONT_BOLD, anchor="w")
+        self.lbl_cost = tk.Label(
+            self.frame, text="$—", bg=th.bg, fg=th.fg_cost,
+            font=self.cfg.font_bold, anchor="w",
+        )
         self.lbl_cost.pack(side=tk.LEFT)
 
+        # Bind events to all widgets
         for w in self.frame.winfo_children() + [self.frame]:
-            w.bind("<Enter>",     self._on_enter)
-            w.bind("<Leave>",     self._on_leave)
-            w.bind("<Button-3>",  self._show_menu)
-            w.bind("<Button-1>",  self._start_drag)
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
+            w.bind("<Button-3>", self._show_menu)
+            w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
 
-    def _assert_topmost(self):
-        """Periodically call Win32 SetWindowPos to stay above the taskbar."""
-        try:
-            if self._hwnd:
-                win32_set_topmost(self._hwnd)
-        except Exception:
-            log.exception("_assert_topmost error")
-        self.root.after(TOPMOST_MS, self._assert_topmost)
+    def _sep(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent, text=" | ", bg=self.cfg.theme.bg,
+            fg=self.cfg.theme.fg_separator, font=self.cfg.font,
+        ).pack(side=tk.LEFT)
 
-    def _position_window(self):
+    # ── Window positioning ───────────────────────────────────────────────────
+
+    def _position_window(self) -> None:
         if self._custom_pos:
             return
-        wa        = get_work_area()
-        screen_h  = get_screen_height()
+        wa = get_work_area()
+        screen_h = get_screen_height()
         taskbar_h = screen_h - wa.bottom
-        w = self.root.winfo_width()
         h = self.root.winfo_height()
-        x = 160
+        x = self.cfg.initial_x
         y = wa.bottom + (taskbar_h - h) // 2
         self.root.geometry(f"+{x}+{y}")
 
-    def _start_drag(self, event):
-        self._drag_start = (event.x_root - self.root.winfo_x(),
-                            event.y_root - self.root.winfo_y())
+    def _loop_topmost(self) -> None:
+        """Periodically reassert z-order above the taskbar."""
+        try:
+            if self._hwnd:
+                set_topmost(self._hwnd)
+        except Exception:
+            log.exception("_loop_topmost error")
+        self.root.after(self.cfg.topmost_ms, self._loop_topmost)
 
-    def _on_drag(self, event):
+    # ── Drag ─────────────────────────────────────────────────────────────────
+
+    def _start_drag(self, event: tk.Event) -> None:
+        self._drag_start = (
+            event.x_root - self.root.winfo_x(),
+            event.y_root - self.root.winfo_y(),
+        )
+
+    def _on_drag(self, event: tk.Event) -> None:
         self._custom_pos = True
         dx, dy = self._drag_start
         self.root.geometry(f"+{event.x_root - dx}+{event.y_root - dy}")
 
-    def _on_enter(self, event=None):
+    # ── Tooltip ──────────────────────────────────────────────────────────────
+
+    def _on_enter(self, event: tk.Event | None = None) -> None:
         if self._tooltip:
             return
         data = load_data()
-        self._tooltip = Tooltip(self.root, data)
-        self._tooltip.position(
-            self.root.winfo_x(),
-            self.root.winfo_y(),
-            self.root.winfo_width(),
-        )
+        self._tooltip = Tooltip(self.root, self.cfg)
+        self._tooltip.update(data)
+        self._tooltip.position(self.root.winfo_x(), self.root.winfo_y())
 
-    def _on_leave(self, event=None):
-        self.root.after(80, self._maybe_hide_tooltip)
+    def _on_leave(self, event: tk.Event | None = None) -> None:
+        self.root.after(self.cfg.tooltip_hide_delay_ms, self._maybe_hide_tooltip)
 
-    def _maybe_hide_tooltip(self):
+    def _maybe_hide_tooltip(self) -> None:
         if self._tooltip is None:
             return
         try:
-            px = self.root.winfo_pointerx()
-            py = self.root.winfo_pointery()
+            px, py = self.root.winfo_pointerx(), self.root.winfo_pointery()
 
+            # Still over main widget?
             wx, wy = self.root.winfo_rootx(), self.root.winfo_rooty()
             ww, wh = self.root.winfo_width(), self.root.winfo_height()
             if wx <= px <= wx + ww and wy <= py <= wy + wh:
                 return
 
+            # Still over tooltip?
             tw = self._tooltip.win
-            tx, ty   = tw.winfo_rootx(), tw.winfo_rooty()
+            tx, ty = tw.winfo_rootx(), tw.winfo_rooty()
             tww, twh = tw.winfo_width(), tw.winfo_height()
-            if tx <= px <= tx + tww and ty <= py <= ty + twh + TOOLTIP_GAP:
+            if tx <= px <= tx + tww and ty <= py <= ty + twh + self.cfg.tooltip_gap:
                 return
         except Exception:
             pass
         self._tooltip.destroy()
         self._tooltip = None
 
-    def _show_menu(self, event):
+    def _hide_tooltip_now(self) -> None:
+        if self._tooltip:
+            self._tooltip.destroy()
+            self._tooltip = None
+
+    # ── Context menu ─────────────────────────────────────────────────────────
+
+    def _show_menu(self, event: tk.Event) -> None:
         self._hide_tooltip_now()
-        menu = tk.Menu(self.root, tearoff=0, bg="#2A2A2A", fg=FG_NORMAL,
-                       activebackground="#3A3A3A", activeforeground="white",
-                       bd=0, relief=tk.FLAT)
+        th = self.cfg.theme
+        menu = tk.Menu(
+            self.root, tearoff=0, bg="#2A2A2A", fg=th.fg_normal,
+            activebackground="#3A3A3A", activeforeground="white",
+            bd=0, relief=tk.FLAT,
+        )
         menu.add_command(label="Zerar sessão", command=self._reset_session)
         menu.add_separator()
         menu.add_command(label="Sair", command=self._exit)
         menu.post(event.x_root, event.y_root)
 
-    def _hide_tooltip_now(self):
-        if self._tooltip:
-            self._tooltip.destroy()
-            self._tooltip = None
-
-    def _reset_session(self):
+    def _reset_session(self) -> None:
         try:
             data = load_data()
             data["session"] = {}
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            save_data(data)
         except Exception:
-            pass
+            log.exception("session reset error")
 
-    def _exit(self):
-        try:
-            os.remove(PID_FILE)
-        except Exception:
-            pass
+    def _exit(self) -> None:
         self.root.destroy()
 
-    def _refresh(self):
+    # ── Refresh loop ─────────────────────────────────────────────────────────
+
+    def _loop_refresh(self) -> None:
         try:
-            data    = load_data()
-            rl      = data.get("rate_limits", {})
-            fh      = rl.get("five_hour", {})
-            sd      = rl.get("seven_day", {})
+            data = load_data()
+            rl = data.get("rate_limits", {})
+            fh = rl.get("five_hour", {})
+            sd = rl.get("seven_day", {})
             session = data.get("session", {})
+            th = self.cfg.theme
 
-            fh_pct   = fh.get("used_pct") or 0.0
-            sd_pct   = sd.get("used_pct") or 0.0
+            fh_pct = fh.get("used_pct") or 0.0
+            sd_pct = sd.get("used_pct") or 0.0
             reset_ts = fh.get("resets_at")
-            cost     = session.get("cost_usd", 0.0) or 0.0
+            cost = session.get("cost_usd", 0.0) or 0.0
 
-            self.lbl_5h.config(   text=f"* {fh_pct:.0f}%",          fg=pct_color(fh_pct))
-            self.lbl_7d.config(   text=f"7d {sd_pct:.0f}%",         fg=pct_color(sd_pct))
-            self.lbl_reset.config(text=fmt_time_until(reset_ts),     fg=FG_RESET)
-            self.lbl_cost.config( text=f"${cost:.4f}" if cost else "$—", fg=FG_COST)
+            self.lbl_5h.config(text=f"* {fh_pct:.0f}%", fg=th.pct_color(fh_pct))
+            self.lbl_7d.config(text=f"7d {sd_pct:.0f}%", fg=th.pct_color(sd_pct))
+            self.lbl_reset.config(text=fmt_time_until(reset_ts))
+            self.lbl_cost.config(text=f"${cost:.4f}" if cost else "$—")
 
+            # Update tooltip in-place if visible
             if self._tooltip:
                 try:
-                    self._tooltip.destroy()
-                    self._tooltip = Tooltip(self.root, data)
-                    self._tooltip.position(
-                        self.root.winfo_x(),
-                        self.root.winfo_y(),
-                        self.root.winfo_width(),
-                    )
+                    self._tooltip.update(data)
                 except Exception:
                     log.exception("tooltip refresh error")
-                    self._tooltip = None
+                    self._hide_tooltip_now()
 
         except Exception:
-            log.exception("_refresh error")
+            log.exception("_loop_refresh error")
 
-        self.root.after(REFRESH_MS, self._refresh)
+        self.root.after(self.cfg.refresh_ms, self._loop_refresh)
 
-    def run(self):
+    # ── Run ──────────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
         log.info("TokenBar starting (pid=%s)", os.getpid())
         self.root.mainloop()
         log.info("TokenBar exiting")
@@ -411,4 +378,5 @@ class TokenBar:
 
 if __name__ == "__main__":
     ensure_singleton()
+    cleanup_pid_file(PID_FILE)  # remove legacy PID file if present
     TokenBar().run()
